@@ -9,7 +9,7 @@ DEPENDS = " \
     sdbusplus \
     "
 
-SRCREV = "58ad5e641c33faa7c7a55e0336a334333feeb4c2"
+SRCREV = "f161953930b4a425a1729c26fb69764dc6b5b7bc"
 
 PACKAGECONFIG ??= " \
     modbus-rtu \
