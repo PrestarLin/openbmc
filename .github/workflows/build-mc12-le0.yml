@@ -1,0 +1,68 @@
+name: Build OpenBMC MC12-LE0
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - gigabyte-mc12-le0
+
+env:
+  MACH: mc12-le0
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git gcc g++ make file wget gawk diffstat bzip2 cpio chrpath \
+            zstd lz4 devscripts diffutils python3 python3-pip python3-pexpect \
+            xz-utils lib32gcc-s1 lib32stdc++6 build-essential
+
+      - name: Setup build environment
+        run: . setup "${{ env.MACH }}"
+        working-directory: ${{ github.workspace }}
+
+      - name: Build
+        run: |
+          set -e
+          . setup "${{ env.MACH }}"
+          bitbake obmc-phosphor-image
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifacts
+          cp tmp/deploy/images/${{ env.MACH }}/image-bmc* artifacts/ 2>/dev/null || true
+          cp tmp/deploy/images/${{ env.MACH }}/mc12-le0-obmc-phosphor-image*.wic.xz artifacts/ 2>/dev/null || true
+          cp tmp/deploy/images/${{ env.MACH }}/mc12-le0-obmc-phosphor-image*.qemu* artifacts/ 2>/dev/null || true
+          ls -la artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openbmc-mc12-le0
+          path: artifacts/
+
+      - name: Upload image-bmc to release
+        if: always()
+        run: |
+          ARTIFACT_DIR=artifacts
+          if [ -f "${ARTIFACT_DIR}/image-bmc" ]; then
+            echo "image-bmc found"
+            ls -la ${ARTIFACT_DIR}/image-bmc
+            md5sum ${ARTIFACT_DIR}/image-bmc
+          else
+            echo "No image-bmc found, listing artifacts:"
+            find ${ARTIFACT_DIR} -type f -name '*image*' 2>/dev/null
+            find tmp/deploy/images/ -type f -name '*image*' 2>/dev/null
+          fi
