@@ -23,9 +23,13 @@ jobs:
 
       - name: Disable AppArmor unprivileged userns restriction
         run: |
-          echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
-          echo "unprivileged_userns_clone=1" | sudo tee /etc/sysctl.d/99-apparmor-userns.conf
-          sudo sysctl -p /etc/sysctl.d/99-apparmor-userns.conf
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+          # On Ubuntu 24.04 also set this; on 22.04 the sysctl doesn't exist
+          if [ -f /proc/sys/unprivileged_userns_clone ]; then
+            echo 1 | sudo tee /proc/sys/unprivileged_userns_clone
+          fi
 
       - name: Setup build deps
         run: |
