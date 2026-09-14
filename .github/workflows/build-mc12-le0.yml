@@ -11,7 +11,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
 
@@ -21,13 +21,19 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Disable AppArmor unprivileged userns restriction
+        run: |
+          echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          echo "unprivileged_userns_clone=1" | sudo tee /etc/sysctl.d/99-apparmor-userns.conf
+          sudo sysctl -p /etc/sysctl.d/99-apparmor-userns.conf
+
       - name: Setup build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git gcc g++ make file wget gawk diffstat bzip2 cpio chrpath \
             zstd lz4 devscripts diffutils python3 python3-pip python3-pexpect \
-            xz-utils lib32gcc-s1 lib32stdc++6 build-essential
+            xz-utils lib32gcc-s1 lib32stdc++6 build-essential ccache
 
       - name: Setup build environment
         run: . setup "${{ env.MACH }}"
@@ -42,9 +48,7 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir -p artifacts
-          cp tmp/deploy/images/${{ env.MACH }}/image-bmc* artifacts/ 2>/dev/null || true
-          cp tmp/deploy/images/${{ env.MACH }}/mc12-le0-obmc-phosphor-image*.wic.xz artifacts/ 2>/dev/null || true
-          cp tmp/deploy/images/${{ env.MACH }}/mc12-le0-obmc-phosphor-image*.qemu* artifacts/ 2>/dev/null || true
+          find tmp/deploy/images/ -type f -name '*image*' -exec cp {} artifacts/ \;
           ls -la artifacts/
 
       - name: Upload artifacts
@@ -52,17 +56,25 @@ jobs:
         with:
           name: openbmc-mc12-le0
           path: artifacts/
+          if-no-files-found: warn
 
-      - name: Upload image-bmc to release
+      - name: Summary
         if: always()
         run: |
           ARTIFACT_DIR=artifacts
+          echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
           if [ -f "${ARTIFACT_DIR}/image-bmc" ]; then
-            echo "image-bmc found"
-            ls -la ${ARTIFACT_DIR}/image-bmc
-            md5sum ${ARTIFACT_DIR}/image-bmc
+            SIZE=$(stat -c%s "${ARTIFACT_DIR}/image-bmc")
+            MD5=$(md5sum "${ARTIFACT_DIR}/image-bmc" | awk '{print $1}')
+            echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| image-bmc size | ${SIZE} bytes |" >> $GITHUB_STEP_SUMMARY
+            echo "| image-bmc md5 | ${MD5} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Expected size | 67108864 bytes |" >> $GITHUB_STEP_SUMMARY
+            SIZE_OK="N/A"
+            [ "$SIZE" -eq 67108864 ] && SIZE_OK="YES" || SIZE_OK="NO"
+            echo "| Size matches | ${SIZE_OK} |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "No image-bmc found, listing artifacts:"
-            find ${ARTIFACT_DIR} -type f -name '*image*' 2>/dev/null
-            find tmp/deploy/images/ -type f -name '*image*' 2>/dev/null
+            echo "No image-bmc produced. Listing artifacts:" >> $GITHUB_STEP_SUMMARY
+            ls -la ${ARTIFACT_DIR}/ >> $GITHUB_STEP_SUMMARY 2>&1 || echo "(empty)" >> $GITHUB_STEP_SUMMARY
           fi
