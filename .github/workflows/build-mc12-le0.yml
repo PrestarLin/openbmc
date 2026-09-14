@@ -1,84 +1,337 @@
+# Build OpenBMC for the Gigabyte MC12-LE0 (AST2500)
+#
+# 三个关键设计点:
+#
+# 1) runs-on 用 ubuntu-latest (2026-09 起映射到 ubuntu-24.04)。
+# **不要退回 ubuntu-22.04**: 该镜像 2026-09-17 起进入 brownout 期(间歇性强制失败),
+# 2027-04-17 彻底移除, 任务会硬报错。
+#
+# 2) Ubuntu 24.04 默认禁止非特权 user namespace, 而 bitbake 的 pseudo / fakeroot
+# 依赖它做沙箱, 因此必须先把 apparmor_restrict_unprivileged_userns 置 0。
+# (这才是 22.04 回退真正想绕开的问题, 正面解决即可。)
+#
+# 3) GitHub 托管 runner 单次 job 上限 6 小时 / 约 14~20 GB 可用磁盘, 而全量构建
+# obmc-phosphor-image 在 4 vCPU 上通常需要更久。因此:
+# - 先清理 runner 预装的大件腾出磁盘;
+# - 缓存 downloads + sstate, 让后续构建增量进行;
+# - 用 resume job 接力: 若首个 job 因超时失败, 第二个 job 会恢复 sstate 继续构建。
+
 name: Build OpenBMC MC12-LE0
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'BitBake 构建目标'
+        required: false
+        default: 'obmc-phosphor-image'
   push:
     branches:
       - gigabyte-mc12-le0
+    paths-ignore:
+      - '**.md'
+      - 'TODO.gigabyte'
+      - 'LICENSE'
+
+concurrency:
+  group: mc12-le0-build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 env:
   MACH: mc12-le0
+  TARGET: obmc-phosphor-image
+  # Yocto 缓存统一放在 workspace 之外, 避免 checkout / clean 时被清掉
+  YOCTO_CACHE: /home/runner/yocto-cache
+  DL_DIR: /home/runner/yocto-cache/downloads
+  SSTATE_DIR: /home/runner/yocto-cache/sstate-cache
+  CCACHE_DIR: /home/runner/yocto-cache/ccache
+  # 托管 runner 规格为 4 vCPU / 16 GB RAM, 再调高容易 OOM
+  BB_NUMBER_THREADS: '4'
+  PARALLEL_MAKE: '-j 4'
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
+    name: Build (attempt 1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          fetch-depth: 1
           submodules: recursive
 
-      - name: Disable AppArmor unprivileged userns restriction
+      - name: Report runner image
         run: |
-          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          . /etc/os-release
+          echo "Runner image: ${PRETTY_NAME}"
+          echo "CPUs: $(nproc), RAM: $(free -g | awk '/Mem:/{print $2}') GB"
+          echo "CPUs: $(nproc), RAM: $(free -g | awk '/Mem:/{print $2}') GB" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Maximize free disk space
+        run: |
+          df -h / | tee /dev/stderr
+          # 删掉 runner 预装、但 OpenBMC 构建用不到的大件(约可回收 10~15 GB)
+          sudo rm -rf \
+            /opt/hostedtoolcache \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/lib/jvm \
+            /opt/az \
+            /opt/microsoft \
+            /usr/lib/mono 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          echo "--- after cleanup ---"
+          df -h / | tee /dev/stderr
+
+      - name: Disable AppArmor unprivileged userns restriction
+        # Ubuntu 24.04+: 默认 1, bitbake 需要非特权 user namespace
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
           fi
-          # On Ubuntu 24.04 also set this; on 22.04 the sysctl doesn't exist
-          if [ -f /proc/sys/unprivileged_userns_clone ]; then
-            echo 1 | sudo tee /proc/sys/unprivileged_userns_clone
+          # 旧版 Ubuntu(打了 userns clone 补丁的内核)走这个开关
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone
+          fi
+          # 验证: 真的能创建 userns 吗?
+          if unshare --user true 2>/dev/null; then
+            echo "OK: unprivileged user namespace available"
+          else
+            echo "::warning::unprivileged user namespace unavailable - bitbake may fail"
           fi
 
-      - name: Setup build deps
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            git gcc g++ make file wget gawk diffstat bzip2 cpio chrpath \
-            zstd lz4 devscripts diffutils python3 python3-pip python3-pexpect \
-            xz-utils lib32gcc-s1 lib32stdc++6 build-essential ccache
+            build-essential git git-lfs python3 python3-pip python3-pexpect python3-git \
+            python3-jinja2 python3-subunit python3-setuptools \
+            gcc g++ make file wget curl gawk diffstat bzip2 xz-utils zstd lz4 \
+            cpio chrpath socat unzip iputils-ping diffutils \
+            libssl-dev liblz4-tool libacl1 locales \
+            lib32gcc-s1 lib32stdc++6 ccache
+          sudo locale-gen en_US.UTF-8
 
-      - name: Setup build environment
-        run: . setup "${{ env.MACH }}"
-        working-directory: ${{ github.workspace }}
+      - name: Restore downloads cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/downloads
+          key: dl-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ runner.os }}-${{ github.ref_name }}-
+            dl-${{ runner.os }}-
+
+      - name: Restore sstate cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/sstate-cache
+          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            sstate-${{ runner.os }}-${{ github.ref_name }}-
+            sstate-${{ runner.os }}-
+
+      - name: Setup OpenBMC build environment
+        run: |
+          . setup "${MACH}"
+          cat >> conf/local.conf <<EOF
+
+          # --- CI overrides ---
+          DL_DIR = "${DL_DIR}"
+          SSTATE_DIR = "${SSTATE_DIR}"
+          BB_NUMBER_THREADS = "${BB_NUMBER_THREADS}"
+          PARALLEL_MAKE = "${PARALLEL_MAKE}"
+          CCACHE_DIR = "${CCACHE_DIR}"
+          INHERIT += "ccache"
+          EOF
+          # 保留 conf 内容以便排查
+          echo "=== local.conf (tail) ==="; tail -12 conf/local.conf
+
+      - name: Pre-fetch sources
+        # 先把源码抓全, 这样即使后面编译超时, 下一次也不用重新下载
+        run: |
+          . setup "${MACH}" >/dev/null
+          bitbake --runall=fetch "${TARGET}" || true
 
       - name: Build
+        id: build
         run: |
-          set -e
-          . setup "${{ env.MACH }}"
-          bitbake obmc-phosphor-image
+          . setup "${MACH}" >/dev/null
+          bitbake "${TARGET}"
 
-      - name: Prepare artifact
+      - name: Save downloads cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/downloads
+          key: dl-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Save sstate cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/sstate-cache
+          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Collect images
+        if: always()
         run: |
           mkdir -p artifacts
-          find tmp/deploy/images/ -type f -name '*image*' -exec cp {} artifacts/ \;
-          ls -la artifacts/
+          IMGDIR="tmp/deploy/images/${MACH}"
+          if [ -d "${IMGDIR}" ]; then
+            # -L: 解引用符号链接, 拿到真实镜像内容
+            cp -L "${IMGDIR}"/image-* artifacts/ 2>/dev/null || true
+          fi
+          ls -lh artifacts/ || true
 
-      - name: Upload artifacts
+      - name: Upload images
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openbmc-mc12-le0
+          name: openbmc-${{ env.MACH }}-${{ github.run_number }}
           path: artifacts/
           if-no-files-found: warn
+          retention-days: 14
 
       - name: Summary
         if: always()
         run: |
-          ARTIFACT_DIR=artifacts
-          echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
-          if [ -f "${ARTIFACT_DIR}/image-bmc" ]; then
-            SIZE=$(stat -c%s "${ARTIFACT_DIR}/image-bmc")
-            MD5=$(md5sum "${ARTIFACT_DIR}/image-bmc" | awk '{print $1}')
-            echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
-            echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| image-bmc size | ${SIZE} bytes |" >> $GITHUB_STEP_SUMMARY
-            echo "| image-bmc md5 | ${MD5} |" >> $GITHUB_STEP_SUMMARY
-            echo "| Expected size | 67108864 bytes |" >> $GITHUB_STEP_SUMMARY
-            SIZE_OK="N/A"
-            [ "$SIZE" -eq 67108864 ] && SIZE_OK="YES" || SIZE_OK="NO"
-            echo "| Size matches | ${SIZE_OK} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Build Summary (attempt 1)"
+            echo
+            echo "| Key | Value |"
+            echo "|-----|-------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f artifacts/image-bmc ]; then
+            SIZE=$(stat -c%s artifacts/image-bmc)
+            echo "| image-bmc size | ${SIZE} bytes |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| image-bmc md5 | $(md5sum artifacts/image-bmc | awk '{print $1}') |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Expected size (64 MiB) | $([ "$SIZE" -eq 67108864 ] && echo YES || echo NO) |" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No image-bmc produced. Listing artifacts:" >> $GITHUB_STEP_SUMMARY
-            ls -la ${ARTIFACT_DIR}/ >> $GITHUB_STEP_SUMMARY 2>&1 || echo "(empty)" >> $GITHUB_STEP_SUMMARY
+            echo "| image-bmc | NOT produced (see logs / resume job) |" >> "$GITHUB_STEP_SUMMARY"
           fi
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Reminder: 托管 runner 单次 job 上限 6 小时; 若本 job 超时, resume job 会接着跑。" >> "$GITHUB_STEP_SUMMARY"
+
+  resume:
+    name: Build (resume after timeout)
+    needs: build
+    # 仅在首个 job 没成功时接力(最常见原因: 6 小时超时)
+    if: always() && needs.build.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Maximize free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /usr/local/share/boost /usr/share/swift /usr/lib/jvm \
+            /opt/az /opt/microsoft /usr/lib/mono 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          df -h /
+
+      - name: Disable AppArmor unprivileged userns restriction
+        run: |
+          # 注意: 用 if 而非 [ ... ] && cmd, 后者在文件不存在时会返回非 0 并因 `set -e` 终止整个 step
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone
+          fi
+          if unshare --user true 2>/dev/null; then
+            echo "OK: unprivileged user namespace available"
+          else
+            echo "::warning::unprivileged user namespace unavailable - bitbake may fail"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git git-lfs python3 python3-pip python3-pexpect python3-git \
+            python3-jinja2 python3-subunit python3-setuptools \
+            gcc g++ make file wget curl gawk diffstat bzip2 xz-utils zstd lz4 \
+            cpio chrpath socat unzip iputils-ping diffutils \
+            libssl-dev liblz4-tool libacl1 locales \
+            lib32gcc-s1 lib32stdc++6 ccache
+          sudo locale-gen en_US.UTF-8
+
+      - name: Restore downloads cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/downloads
+          key: dl-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ runner.os }}-${{ github.ref_name }}-
+            dl-${{ runner.os }}-
+
+      - name: Restore sstate cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/sstate-cache
+          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            sstate-${{ runner.os }}-${{ github.ref_name }}-
+            sstate-${{ runner.os }}-
+
+      - name: Setup OpenBMC build environment
+        run: |
+          . setup "${MACH}"
+          cat >> conf/local.conf <<EOF
+
+          # --- CI overrides ---
+          DL_DIR = "${DL_DIR}"
+          SSTATE_DIR = "${SSTATE_DIR}"
+          BB_NUMBER_THREADS = "${BB_NUMBER_THREADS}"
+          PARALLEL_MAKE = "${PARALLEL_MAKE}"
+          CCACHE_DIR = "${CCACHE_DIR}"
+          INHERIT += "ccache"
+          EOF
+
+      - name: Build (continuing from sstate)
+        run: |
+          . setup "${MACH}" >/dev/null
+          bitbake "${TARGET}"
+
+      - name: Save sstate cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.YOCTO_CACHE }}/sstate-cache
+          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+
+      - name: Collect images
+        if: always()
+        run: |
+          mkdir -p artifacts
+          IMGDIR="tmp/deploy/images/${MACH}"
+          [ -d "${IMGDIR}" ] && cp -L "${IMGDIR}"/image-* artifacts/ 2>/dev/null || true
+          ls -lh artifacts/ || true
+
+      - name: Upload images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openbmc-${{ env.MACH }}-resume-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
