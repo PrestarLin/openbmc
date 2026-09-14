@@ -3,18 +3,18 @@
 # 三个关键设计点:
 #
 # 1) runs-on 用 ubuntu-latest (2026-09 起映射到 ubuntu-24.04)。
-# **不要退回 ubuntu-22.04**: 该镜像 2026-09-17 起进入 brownout 期(间歇性强制失败),
-# 2027-04-17 彻底移除, 任务会硬报错。
+#    **不要退回 ubuntu-22.04**: 该镜像 2026-09-17 起进入 brownout 期(间歇性强制失败),
+#    2027-04-17 彻底移除, 任务会硬报错。
 #
 # 2) Ubuntu 24.04 默认禁止非特权 user namespace, 而 bitbake 的 pseudo / fakeroot
-# 依赖它做沙箱, 因此必须先把 apparmor_restrict_unprivileged_userns 置 0。
-# (这才是 22.04 回退真正想绕开的问题, 正面解决即可。)
+#    依赖它做沙箱, 因此必须先把 apparmor_restrict_unprivileged_userns 置 0。
+#    (这才是 22.04 回退真正想绕开的问题, 正面解决即可。)
 #
 # 3) GitHub 托管 runner 单次 job 上限 6 小时 / 约 14~20 GB 可用磁盘, 而全量构建
-# obmc-phosphor-image 在 4 vCPU 上通常需要更久。因此:
-# - 先清理 runner 预装的大件腾出磁盘;
-# - 缓存 downloads + sstate, 让后续构建增量进行;
-# - 用 resume job 接力: 若首个 job 因超时失败, 第二个 job 会恢复 sstate 继续构建。
+#    obmc-phosphor-image 在 4 vCPU 上通常需要更久。因此:
+#      - 先清理 runner 预装的大件腾出磁盘;
+#      - 缓存 downloads + sstate, 让后续构建增量进行;
+#      - 用 resume job 接力: 若首个 job 因超时失败, 第二个 job 会恢复 sstate 继续构建。
 
 name: Build OpenBMC MC12-LE0
 
@@ -241,8 +241,8 @@ jobs:
       - name: Maximize free disk space
         run: |
           sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android \
-            /opt/ghc /usr/local/share/boost /usr/share/swift /usr/lib/jvm \
-            /opt/az /opt/microsoft /usr/lib/mono 2>/dev/null || true
+                      /opt/ghc /usr/local/share/boost /usr/share/swift /usr/lib/jvm \
+                      /opt/az /opt/microsoft /usr/lib/mono 2>/dev/null || true
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
           df -h /
