@@ -168,7 +168,12 @@ jobs:
         id: build
         run: |
           . setup "${MACH}" >/dev/null
-          bitbake "${TARGET}"
+          # 6 小时超时时 GitHub 先 SIGTERM 再 SIGKILL。若不拦, bitbake 直接被杀,
+          # sstate 不落盘, resume job 只能从零冷启。转成 SIGINT 让 bitbake
+          # 跑完当前 task 并 flush sstate 再退。
+          trap 'echo "::warning::build interrupted; flushing sstate..."; kill -INT $(jobs -p) 2>/dev/null || true; wait' INT TERM
+          bitbake "${TARGET}" &
+          wait $!
 
       - name: Save downloads cache
         if: always()
@@ -313,7 +318,9 @@ jobs:
       - name: Build (continuing from sstate)
         run: |
           . setup "${MACH}" >/dev/null
-          bitbake "${TARGET}"
+          trap 'echo "::warning::resume interrupted; flushing sstate..."; kill -INT $(jobs -p) 2>/dev/null || true; wait' INT TERM
+          bitbake "${TARGET}" &
+          wait $!
 
       - name: Save sstate cache
         if: always()
