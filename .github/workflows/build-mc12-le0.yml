@@ -42,7 +42,8 @@ permissions:
 
 env:
   MACH: mc12-le0
-  TARGET: obmc-phosphor-image
+  # 允许 workflow_dispatch 传 target; push 触发时用默认
+  TARGET: ${{ github.event.inputs.target || 'obmc-phosphor-image' }}
   # Yocto 缓存统一放在 workspace 之外, 避免 checkout / clean 时被清掉
   YOCTO_CACHE: /home/runner/yocto-cache
   DL_DIR: /home/runner/yocto-cache/downloads
@@ -55,6 +56,8 @@ env:
 jobs:
   build:
     name: Build (attempt 1)
+    # 只在 workflow_dispatch 或 commit message 带 [build]/[rebuild] 时真跑; 日常 push 不烧 runner
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]') || contains(github.event.head_commit.message, '[rebuild]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -125,18 +128,18 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/downloads
-          key: dl-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: dl-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
           restore-keys: |
-            dl-${{ runner.os }}-${{ github.ref_name }}-
+            dl-${{ runner.os }}-${{ env.MACH }}-
             dl-${{ runner.os }}-
 
       - name: Restore sstate cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/sstate-cache
-          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: sstate-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/machine/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
           restore-keys: |
-            sstate-${{ runner.os }}-${{ github.ref_name }}-
+            sstate-${{ runner.os }}-${{ env.MACH }}-
             sstate-${{ runner.os }}-
 
       - name: Setup OpenBMC build environment
@@ -173,7 +176,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/downloads
-          key: dl-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: dl-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
 
       - name: Save sstate cache
         if: always()
@@ -181,7 +184,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/sstate-cache
-          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: sstate-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/machine/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
 
       - name: Collect images
         if: always()
@@ -225,6 +228,7 @@ jobs:
 
   resume:
     name: Build (resume after timeout)
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]') || contains(github.event.head_commit.message, '[rebuild]') }}
     needs: build
     # 仅在首个 job 没成功时接力(最常见原因: 6 小时超时)
     if: always() && needs.build.result != 'success'
@@ -278,18 +282,18 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/downloads
-          key: dl-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: dl-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
           restore-keys: |
-            dl-${{ runner.os }}-${{ github.ref_name }}-
+            dl-${{ runner.os }}-${{ env.MACH }}-
             dl-${{ runner.os }}-
 
       - name: Restore sstate cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/sstate-cache
-          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: sstate-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/machine/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
           restore-keys: |
-            sstate-${{ runner.os }}-${{ github.ref_name }}-
+            sstate-${{ runner.os }}-${{ env.MACH }}-
             sstate-${{ runner.os }}-
 
       - name: Setup OpenBMC build environment
@@ -317,7 +321,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.YOCTO_CACHE }}/sstate-cache
-          key: sstate-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          key: sstate-${{ runner.os }}-${{ env.MACH }}-${{ hashFiles('conf/local.conf', 'conf/machine/**', 'meta/**', '**/*.bb', '**/*.bbappend') }}
 
       - name: Collect images
         if: always()
